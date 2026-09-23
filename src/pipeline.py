@@ -43,9 +43,16 @@ def _get_last_processed_ids(engine: Engine) -> dict:
     Henter det højeste raw_id og stg_id der er blevet behandlet i tidligere,
     succesfulde kørsler. Bruges til incremental load.
 
-    Simpel tilgang: vi gemmer highwater marks direkte som MAX(raw_id) fra
-    stg_meter_readings' kilde-reference ville være mere præcist, men her
-    holder vi det simpelt ved at spore det i egne kolonner i pipeline_runs.
+    FAILURE RECOVERY: watermarks opdateres KUN når en kørsel ender med
+    status='SUCCESS' (se _finish_run). Hvis fx transformation fejler efter
+    at staging allerede er committet, forbliver last_processed_stg_id på
+    den GAMLE værdi. Næste kørsel vil derfor:
+      - ikke genindsætte de samme staging-rækker (UNIQUE constraint + vores
+        DUPLICATE_EXISTING-tjek forhindrer det)
+      - men VIL forsøge at transformere de staging-rækker igen, fordi
+        watermarket for stg_id ikke blev flyttet forbi dem
+    Det er netop pointen: ingen data tabes, og ingen dubletter opstår,
+    fordi hvert trin er idempotent uafhængigt af de andre.
     """
     query = text(
         """
@@ -75,17 +82,22 @@ def _start_run(engine: Engine) -> int:
         return result.lastrowid
 
 
-def _finish_run(engine: Engine, run_id: int, status: str, records_read: int,
-                 records_inserted: int, records_rejected: int,
+def _finish_run(engine: Engine, run_id: int, status: str, metrics: dict,
                  last_processed_raw_id: int, last_processed_stg_id: int) -> None:
     update_sql = text(
         """
         UPDATE pipeline_runs
         SET end_time = :end_time,
             status = :status,
-            records_read = :records_read,
-            records_inserted = :records_inserted,
-            records_rejected = :records_rejected,
+            files_discovered = :files_discovered,
+            files_ingested = :files_ingested,
+            files_skipped = :files_skipped,
+            raw_rows_ingested = :raw_rows_ingested,
+            raw_rows_validated = :raw_rows_validated,
+            staging_rows_inserted = :staging_rows_inserted,
+            staging_rows_rejected = :staging_rows_rejected,
+            duplicates_skipped = :duplicates_skipped,
+            facts_inserted = :facts_inserted,
             last_processed_raw_id = :last_processed_raw_id,
             last_processed_stg_id = :last_processed_stg_id
         WHERE run_id = :run_id
@@ -97,9 +109,15 @@ def _finish_run(engine: Engine, run_id: int, status: str, records_read: int,
             {
                 "end_time": _now_iso(),
                 "status": status,
-                "records_read": records_read,
-                "records_inserted": records_inserted,
-                "records_rejected": records_rejected,
+                "files_discovered": metrics.get("files_discovered", 0),
+                "files_ingested": metrics.get("files_ingested", 0),
+                "files_skipped": metrics.get("files_skipped", 0),
+                "raw_rows_ingested": metrics.get("raw_rows_ingested", 0),
+                "raw_rows_validated": metrics.get("raw_rows_validated", 0),
+                "staging_rows_inserted": metrics.get("staging_rows_inserted", 0),
+                "staging_rows_rejected": metrics.get("staging_rows_rejected", 0),
+                "duplicates_skipped": metrics.get("duplicates_skipped", 0),
+                "facts_inserted": metrics.get("facts_inserted", 0),
                 "last_processed_raw_id": last_processed_raw_id,
                 "last_processed_stg_id": last_processed_stg_id,
                 "run_id": run_id,
@@ -110,23 +128,30 @@ def _finish_run(engine: Engine, run_id: int, status: str, records_read: int,
 def run_pipeline(engine: Engine, raw_data_dir: Path) -> dict:
     """
     Kører hele pipeline'en én gang:
-      1. Ingester alle filer i raw_data_dir -> raw_meter_readings
+      1. Ingester filer i raw_data_dir -> raw_meter_readings (file-level
+         idempotent: uændrede filer springes over, se ingestion.py)
       2. Validerer nye raw-rækker -> stg_meter_readings (+ data_quality_errors)
       3. Transformerer nye staging-rækker -> dim_meter / fact_water_consumption
-      4. Logger et pipeline_runs-record med status og tællere
+      4. Logger et pipeline_runs-record med status og eksplicitte tællere
+
+    Hvert trin (2 og 3) er sin egen atomiske transaktion (se validation.py
+    og transformation.py) - IKKE én kæmpe transaktion for hele pipelinen.
+    Det betyder at hvis trin 3 fejler, er trin 2's resultater allerede
+    holdbart committet, og næste kørsel kan genoptage derfra (se
+    _get_last_processed_ids).
 
     Returnerer et summary-dict til brug i main.py / logging.
     """
     run_id = _start_run(engine)
     logger.info("Pipeline run %d startet", run_id)
 
+    metrics = {}
     try:
-        # --- Trin 1: Ingestion (altid fuld - filer flyttes/arkiveres i en
-        # rigtig løsning, så vi ikke genindlæser dem; her holder vi det
-        # simpelt og antager mappen kun indeholder nye filer). ---
-        files_read = ingest_directory(engine, raw_data_dir)
+        # --- Trin 1: Ingestion (file-level idempotent) ---
+        ingestion_summary = ingest_directory(engine, raw_data_dir)
+        metrics.update(ingestion_summary)
 
-        # --- Trin 2: Incremental validation (raw -> staging) ---
+        # --- Trin 2: Incremental validation (raw -> staging), atomisk ---
         last_ids = _get_last_processed_ids(engine)
         raw_df = fetch_unprocessed_raw(engine, since_raw_id=last_ids["raw_id"])
         validation_summary = validate_and_load_staging(engine, raw_df)
@@ -135,33 +160,30 @@ def run_pipeline(engine: Engine, raw_data_dir: Path) -> dict:
             int(raw_df["raw_id"].max()) if not raw_df.empty else last_ids["raw_id"]
         )
 
-        # --- Trin 3: Incremental transformation (staging -> analytics) ---
+        metrics["raw_rows_validated"] = len(raw_df)
+        metrics["staging_rows_inserted"] = validation_summary["accepted"]
+        metrics["staging_rows_rejected"] = validation_summary["rejected"]
+        metrics["duplicates_skipped"] = validation_summary["duplicates_skipped"]
+
+        # --- Trin 3: Incremental transformation (staging -> analytics), atomisk ---
         staging_df = fetch_unprocessed_staging(engine, since_stg_id=last_ids["stg_id"])
         inserted_facts = transform_staging_to_fact(engine, staging_df)
 
         new_last_stg_id = (
             int(staging_df["stg_id"].max()) if not staging_df.empty else last_ids["stg_id"]
         )
+        metrics["facts_inserted"] = inserted_facts
 
         _finish_run(
-            engine,
-            run_id,
-            status="SUCCESS",
-            records_read=len(raw_df),
-            records_inserted=inserted_facts,
-            records_rejected=validation_summary["rejected"],
+            engine, run_id, status="SUCCESS", metrics=metrics,
             last_processed_raw_id=new_last_raw_id,
             last_processed_stg_id=new_last_stg_id,
         )
 
         summary = {
             "run_id": run_id,
-            "files_ingested_rows": files_read,
-            "raw_rows_read": len(raw_df),
-            "staging_accepted": validation_summary["accepted"],
-            "staging_rejected": validation_summary["rejected"],
-            "facts_inserted": inserted_facts,
             "status": "SUCCESS",
+            **metrics,
         }
         logger.info("Pipeline run %d fuldført: %s", run_id, summary)
         return summary
@@ -169,13 +191,7 @@ def run_pipeline(engine: Engine, raw_data_dir: Path) -> dict:
     except Exception:
         logger.exception("Pipeline run %d fejlede", run_id)
         _finish_run(
-            engine,
-            run_id,
-            status="FAILED",
-            records_read=0,
-            records_inserted=0,
-            records_rejected=0,
-            last_processed_raw_id=0,
-            last_processed_stg_id=0,
+            engine, run_id, status="FAILED", metrics=metrics,
+            last_processed_raw_id=0, last_processed_stg_id=0,
         )
         raise

@@ -15,12 +15,27 @@ Hvorfor SQLAlchemy Core (ikke ORM) her?
 """
 
 from pathlib import Path
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 from sqlalchemy.engine import Engine
 
 # Central placering af databasefilen.
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "warehouse.db"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "sql" / "schema.sql"
+
+
+def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:
+    """
+    SQLite håndhæver IKKE foreign keys som standard - det er en per-connection
+    indstilling (PRAGMA foreign_keys = ON), ikke noget der er slået til globalt
+    for databasefilen. Uden dette ville FOREIGN KEY-definitionerne i schema.sql
+    kun være dokumentation, ikke en reel constraint.
+
+    Vi bruger SQLAlchemy's connect-event til at sætte PRAGMA'en på HVER ny
+    DBAPI-forbindelse i poolen, så det er trygt uanset connection pooling.
+    """
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 
 def get_engine(db_path: Path = DB_PATH) -> Engine:
@@ -33,7 +48,9 @@ def get_engine(db_path: Path = DB_PATH) -> Engine:
     da vi undgår SQLite-specifik syntaks i vores forretningslogik.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(f"sqlite:///{db_path}")
+    engine = create_engine(f"sqlite:///{db_path}")
+    event.listen(engine, "connect", _enable_sqlite_foreign_keys)
+    return engine
 
 
 def init_db(engine: Engine, schema_path: Path = SCHEMA_PATH) -> None:

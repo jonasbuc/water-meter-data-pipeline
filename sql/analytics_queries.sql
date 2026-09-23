@@ -111,7 +111,33 @@ ORDER BY error_count DESC;
 -- 10. Pipeline health: seneste 5 kørsler
 SELECT
     run_id, start_time, end_time, status,
-    records_read, records_inserted, records_rejected
+    files_discovered, files_ingested, files_skipped,
+    raw_rows_ingested, raw_rows_validated,
+    staging_rows_inserted, staging_rows_rejected, duplicates_skipped,
+    facts_inserted
 FROM pipeline_runs
 ORDER BY run_id DESC
 LIMIT 5;
+
+
+-- 11. LINEAGE / DEBUGGING: "hvor kom denne fact-række fra?"
+-- Starter i fact_water_consumption og følger den tekniske lineage
+-- (source_stg_id -> stg_id, raw_id -> raw_id) tilbage til raw og filen
+-- den blev indlæst fra. Bemærk: dette er teknisk metadata, IKKE en
+-- forretningsdimension - den bruges til debugging/audit, ikke i BI-rapporter.
+SELECT
+    f.fact_id,
+    d.meter_id,
+    f.reading_timestamp,
+    r.source_file,
+    r.raw_id,
+    s.stg_id,
+    r.ingested_at,
+    s.processed_at
+FROM fact_water_consumption f
+JOIN dim_meter d            ON d.meter_key = f.meter_key
+JOIN stg_meter_readings s   ON s.stg_id = f.source_stg_id
+JOIN raw_meter_readings r   ON r.raw_id = s.raw_id
+ORDER BY f.fact_id DESC
+LIMIT 20;
+

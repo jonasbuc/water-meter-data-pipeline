@@ -7,6 +7,7 @@ Tester de vigtigste valideringsregler i validation.py.
 import pandas as pd
 
 from src.validation import validate_and_load_staging
+from tests.conftest import insert_raw_row
 
 
 def _raw_row(raw_id, meter_id, timestamp_raw, consumption, temperature="14.0",
@@ -23,6 +24,7 @@ def _raw_row(raw_id, meter_id, timestamp_raw, consumption, temperature="14.0",
 
 
 def test_negative_consumption_is_rejected(engine):
+    insert_raw_row(engine, 1)
     raw_df = pd.DataFrame([
         _raw_row(1, "M-001", "2026-09-20T08:00:00", "-10.0"),
     ])
@@ -40,6 +42,7 @@ def test_negative_consumption_is_rejected(engine):
 
 
 def test_missing_meter_id_is_rejected(engine):
+    insert_raw_row(engine, 1)
     raw_df = pd.DataFrame([
         _raw_row(1, None, "2026-09-20T08:00:00", "50.0"),
     ])
@@ -51,6 +54,7 @@ def test_missing_meter_id_is_rejected(engine):
 
 
 def test_invalid_timestamp_is_rejected(engine):
+    insert_raw_row(engine, 1)
     raw_df = pd.DataFrame([
         _raw_row(1, "M-001", "not-a-date", "50.0"),
     ])
@@ -62,6 +66,7 @@ def test_invalid_timestamp_is_rejected(engine):
 
 
 def test_valid_record_is_accepted(engine):
+    insert_raw_row(engine, 1)
     raw_df = pd.DataFrame([
         _raw_row(1, "M-001", "2026-09-20T08:00:00", "50.0"),
     ])
@@ -84,6 +89,8 @@ def test_duplicate_record_is_not_inserted_twice(engine):
     Idempotency-test: samme (meter_id, timestamp) valideret to gange
     (fx fordi samme fil blev indlæst to gange) må kun give én staging-række.
     """
+    insert_raw_row(engine, 1)
+    insert_raw_row(engine, 2)
     raw_df = pd.DataFrame([
         _raw_row(1, "M-001", "2026-09-20T08:00:00", "50.0"),
     ])
@@ -95,8 +102,10 @@ def test_duplicate_record_is_not_inserted_twice(engine):
     ])
     summary = validate_and_load_staging(engine, raw_df_again)
 
-    # INSERT OR IGNORE betyder rowcount for den anden insert er 0
+    # Denne dublet findes allerede i staging (DUPLICATE_EXISTING) -> tælles
+    # i duplicates_skipped, ikke som en almindelig afvisning.
     assert summary["accepted"] == 0
+    assert summary["duplicates_skipped"] == 1
 
     with engine.connect() as conn:
         count = conn.exec_driver_sql(

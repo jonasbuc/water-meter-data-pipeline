@@ -56,6 +56,28 @@ def _parse_float(raw_value: Optional[str]) -> Optional[float]:
         return None
 
 
+def _is_blank(raw_value: Optional[str]) -> bool:
+    """Afgør om en rå værdi er 'tom' (manglende), modsat 'til stede men ugyldig'."""
+    return raw_value is None or str(raw_value).strip() in ("", "nan", "None")
+
+
+def _parse_temperature(raw_value: Optional[str]) -> tuple:
+    """
+    Temperatur er et OPTIONALT felt, men vi skelner eksplicit mellem:
+      - manglende/tom værdi   -> accepteres stille som NULL (ikke en fejl)
+      - til stede, men ikke parsbar -> kernemålingen kan stadig accepteres,
+        men vi registrerer en WARNING (rækken er ikke forkert, bare ufuldstændig)
+
+    Returnerer (value: float|None, warning_detail: str|None).
+    """
+    if raw_value is None or _is_blank(raw_value):
+        return None, None
+    try:
+        return float(str(raw_value)), None
+    except (ValueError, TypeError):
+        return None, f"Kunne ikke parse temperature: {raw_value!r}"
+
+
 def fetch_unprocessed_raw(engine: Engine, since_raw_id: int = 0) -> pd.DataFrame:
     """
     Henter raw-rækker med raw_id > since_raw_id.
@@ -75,111 +97,157 @@ def fetch_unprocessed_raw(engine: Engine, since_raw_id: int = 0) -> pd.DataFrame
 def validate_and_load_staging(engine: Engine, raw_df: pd.DataFrame) -> dict:
     """
     Validerer rækker fra raw_df og indsætter gyldige rækker i stg_meter_readings.
-    Ugyldige rækker logges i data_quality_errors.
+    Ugyldige rækker logges i data_quality_errors (severity=ERROR).
+    Accepterede rækker med en mindre kvalitetsbemærkning (fx ikke-parsbar
+    temperatur) logges også, men med severity=WARNING - rækken forkastes IKKE.
 
-    Returnerer et dict med tælleres til logging: {read, accepted, rejected}.
+    Transaktionsgrænse (atomicity): staging-indsættelse og fejl/warning-
+    indsættelse sker i ÉN transaktion (ét kald til engine.begin()). De hører
+    logisk sammen som ét pipeline-trin ("RAW -> STAGING"), så enten committer
+    begge dele, eller ingen af dem gør (rollback ved exception).
+
+    Dubletter (samme meter_id+reading_timestamp) skelnes eksplicit:
+      - DUPLICATE_IN_BATCH:   optræder to gange i SAMME batch -> reel
+        data-kvalitetsfejl (severity=ERROR), da kilden har sendt samme
+        måling to gange i én fil.
+      - DUPLICATE_EXISTING:   findes allerede i staging fra en TIDLIGERE
+        kørsel. Dette er IKKE en datakvalitetsfejl - det er forventet
+        operationel adfærd når fx en fil delvist er behandlet før, eller
+        watermarks overlapper. Den tælles i `duplicates_skipped` i stedet
+        for at blive gemt i data_quality_errors, fordi den ikke fortæller
+        noget om dataens kvalitet - kun at pipelinen allerede har set den.
+
+    Returnerer et summary-dict: {read, accepted, rejected, duplicates_skipped}.
     """
     accepted_rows = []
-    rejected_rows = []
+    rejected_rows = []  # severity=ERROR -> rækken er IKKE i staging
+    warning_rows = []   # severity=WARNING -> rækken ER i staging
     seen_keys_in_batch = set()  # fanger dubletter INDEN for samme batch
+    duplicates_skipped = 0
 
     processed_at = _now_iso()
 
-    for _, row in raw_df.iterrows():
-        raw_id = row["raw_id"]
-        meter_id = row["meter_id"]
-        source_file = row["source_file"]
-
-        # --- Regel 1: meter_id må ikke mangle ---
-        if meter_id is None or str(meter_id).strip() in ("", "nan", "None"):
-            rejected_rows.append(
-                _make_error(raw_id, meter_id, None, "MISSING_METER_ID",
-                            "meter_id er tom eller NULL", source_file, processed_at)
-            )
-            continue
-
-        # --- Regel 2: timestamp skal kunne parses ---
-        parsed_ts = _parse_timestamp(row["timestamp_raw"])
-        if parsed_ts is None:
-            rejected_rows.append(
-                _make_error(raw_id, meter_id, row["timestamp_raw"], "INVALID_TIMESTAMP",
-                            f"Kunne ikke parse timestamp: {row['timestamp_raw']!r}",
-                            source_file, processed_at)
-            )
-            continue
-
-        # --- Regel 3: consumption skal kunne parses og må ikke være negativ ---
-        consumption = _parse_float(row["consumption_liters"])
-        if consumption is None:
-            rejected_rows.append(
-                _make_error(raw_id, meter_id, parsed_ts, "INVALID_CONSUMPTION",
-                            f"Kunne ikke parse consumption_liters: {row['consumption_liters']!r}",
-                            source_file, processed_at)
-            )
-            continue
-        if consumption < 0:
-            rejected_rows.append(
-                _make_error(raw_id, meter_id, parsed_ts, "NEGATIVE_CONSUMPTION",
-                            f"consumption_liters er negativ: {consumption}",
-                            source_file, processed_at)
-            )
-            continue
-
-        # --- Regel 4: dublet inden for samme batch ---
-        key = (meter_id, parsed_ts)
-        if key in seen_keys_in_batch:
-            rejected_rows.append(
-                _make_error(raw_id, meter_id, parsed_ts, "DUPLICATE_IN_BATCH",
-                            "Samme meter_id + timestamp optræder to gange i denne batch",
-                            source_file, processed_at)
-            )
-            continue
-        seen_keys_in_batch.add(key)
-
-        temperature = _parse_float(row["temperature"])
-
-        accepted_rows.append(
-            {
-                "meter_id": meter_id,
-                "reading_timestamp": parsed_ts,
-                "consumption_liters": consumption,
-                "temperature": temperature,
-                "status": row["status"],
-                "source_file": source_file,
-                "processed_at": processed_at,
-            }
+    with engine.begin() as conn:
+        existing_keys = set(
+            tuple(r) for r in conn.execute(
+                text("SELECT meter_id, reading_timestamp FROM stg_meter_readings")
+            ).fetchall()
         )
 
-    inserted_count = _insert_staging_rows(engine, accepted_rows)
-    _insert_error_rows(engine, rejected_rows)
+        for _, row in raw_df.iterrows():
+            raw_id = row["raw_id"]
+            meter_id = row["meter_id"]
+            source_file = row["source_file"]
+
+            # --- Regel 1: meter_id må ikke mangle ---
+            if meter_id is None or str(meter_id).strip() in ("", "nan", "None"):
+                rejected_rows.append(
+                    _make_error(raw_id, meter_id, None, "MISSING_METER_ID",
+                                "meter_id er tom eller NULL", source_file, processed_at)
+                )
+                continue
+
+            # --- Regel 2: timestamp skal kunne parses ---
+            parsed_ts = _parse_timestamp(row["timestamp_raw"])
+            if parsed_ts is None:
+                rejected_rows.append(
+                    _make_error(raw_id, meter_id, row["timestamp_raw"], "INVALID_TIMESTAMP",
+                                f"Kunne ikke parse timestamp: {row['timestamp_raw']!r}",
+                                source_file, processed_at)
+                )
+                continue
+
+            # --- Regel 3: consumption skal kunne parses og må ikke være negativ ---
+            consumption = _parse_float(row["consumption_liters"])
+            if consumption is None:
+                rejected_rows.append(
+                    _make_error(raw_id, meter_id, parsed_ts, "INVALID_CONSUMPTION",
+                                f"Kunne ikke parse consumption_liters: {row['consumption_liters']!r}",
+                                source_file, processed_at)
+                )
+                continue
+            if consumption < 0:
+                rejected_rows.append(
+                    _make_error(raw_id, meter_id, parsed_ts, "NEGATIVE_CONSUMPTION",
+                                f"consumption_liters er negativ: {consumption}",
+                                source_file, processed_at)
+                )
+                continue
+
+            key = (meter_id, parsed_ts)
+
+            # --- Regel 4a: dublet inden for samme batch -> reel datakvalitetsfejl ---
+            if key in seen_keys_in_batch:
+                rejected_rows.append(
+                    _make_error(raw_id, meter_id, parsed_ts, "DUPLICATE_IN_BATCH",
+                                "Samme meter_id + timestamp optræder to gange i denne batch",
+                                source_file, processed_at)
+                )
+                continue
+
+            # --- Regel 4b: dublet ift. allerede committet staging -> operationel, ikke fejl ---
+            if key in existing_keys:
+                duplicates_skipped += 1
+                continue
+
+            seen_keys_in_batch.add(key)
+
+            # --- Regel 5: temperatur er optional. Skeln mangler vs. ugyldig ---
+            temperature, temp_warning = _parse_temperature(row["temperature"])
+            if temp_warning:
+                warning_rows.append(
+                    _make_error(raw_id, meter_id, parsed_ts, "MALFORMED_TEMPERATURE",
+                                temp_warning, source_file, processed_at, severity="WARNING")
+                )
+
+            accepted_rows.append(
+                {
+                    "raw_id": int(raw_id),
+                    "meter_id": meter_id,
+                    "reading_timestamp": parsed_ts,
+                    "consumption_liters": consumption,
+                    "temperature": temperature,
+                    "status": row["status"],
+                    "source_file": source_file,
+                    "processed_at": processed_at,
+                }
+            )
+
+        inserted_count = _insert_staging_rows(conn, accepted_rows)
+        _insert_error_rows(conn, rejected_rows + warning_rows)
 
     return {
         "read": len(raw_df),
         "accepted": inserted_count,
         "rejected": len(rejected_rows),
+        "duplicates_skipped": duplicates_skipped,
     }
 
 
 def _make_error(raw_id, meter_id, reading_timestamp, error_type, error_detail,
-                 source_file, detected_at) -> dict:
+                 source_file, detected_at, severity: str = "ERROR") -> dict:
     return {
         "raw_id": int(raw_id) if raw_id is not None else None,
         "meter_id": meter_id,
         "reading_timestamp": reading_timestamp,
         "error_type": error_type,
+        "severity": severity,
         "error_detail": error_detail,
         "source_file": source_file,
         "detected_at": detected_at,
     }
 
 
-def _insert_staging_rows(engine: Engine, rows: list) -> int:
+def _insert_staging_rows(conn, rows: list) -> int:
     """
-    Indsætter accepterede rækker i staging.
+    Indsætter accepterede rækker i staging (på en overdraget Connection, så
+    dette er en del af kalderens transaktion - se validate_and_load_staging).
 
-    Bruger 'INSERT OR IGNORE' (SQLite-specifik syntaks) til at håndhæve
-    idempotency: hvis (meter_id, reading_timestamp) allerede findes fra en
-    tidligere kørsel, springes rækken stille over i stedet for at fejle.
+    Bruger 'INSERT OR IGNORE' (SQLite-specifik syntaks) som SIDSTE
+    sikkerhedsnet mod dubletter (database-uniqueness). Applikationskoden
+    ovenfor har allerede filtreret DUPLICATE_IN_BATCH og DUPLICATE_EXISTING
+    fra, så denne constraint bør normalt ikke ramme noget her - men den
+    beskytter mod race conditions og fremtidige kode-ændringer.
 
     SQL Server-ækvivalent: MERGE-statement, eller
     "INSERT ... WHERE NOT EXISTS (...)".
@@ -190,30 +258,28 @@ def _insert_staging_rows(engine: Engine, rows: list) -> int:
     insert_sql = text(
         """
         INSERT OR IGNORE INTO stg_meter_readings
-            (meter_id, reading_timestamp, consumption_liters, temperature,
+            (raw_id, meter_id, reading_timestamp, consumption_liters, temperature,
              status, source_file, processed_at)
         VALUES
-            (:meter_id, :reading_timestamp, :consumption_liters, :temperature,
+            (:raw_id, :meter_id, :reading_timestamp, :consumption_liters, :temperature,
              :status, :source_file, :processed_at)
         """
     )
-    with engine.begin() as conn:
-        result = conn.execute(insert_sql, rows)
-        return result.rowcount if result.rowcount is not None else len(rows)
+    result = conn.execute(insert_sql, rows)
+    return result.rowcount if result.rowcount is not None else len(rows)
 
 
-def _insert_error_rows(engine: Engine, rows: list) -> None:
+def _insert_error_rows(conn, rows: list) -> None:
     if not rows:
         return
     insert_sql = text(
         """
         INSERT INTO data_quality_errors
-            (raw_id, meter_id, reading_timestamp, error_type, error_detail,
+            (raw_id, meter_id, reading_timestamp, error_type, severity, error_detail,
              source_file, detected_at)
         VALUES
-            (:raw_id, :meter_id, :reading_timestamp, :error_type, :error_detail,
+            (:raw_id, :meter_id, :reading_timestamp, :error_type, :severity, :error_detail,
              :source_file, :detected_at)
         """
     )
-    with engine.begin() as conn:
-        conn.execute(insert_sql, rows)
+    conn.execute(insert_sql, rows)

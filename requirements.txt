@@ -1,3 +1,7 @@
-pandas
-sqlalchemy
-pytest
+# Python 3.11+ anbefales (se README).
+# Vi bruger sensible version-ranges frem for at pinne alle transitive
+# afhængigheder - det er et lille undervisningsprojekt, ikke noget der
+# skal reproduceres byte-for-byte i produktion.
+pandas>=2.0,<3.0
+sqlalchemy>=2.0,<3.0
+pytest>=7.0,<9.0
