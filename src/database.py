@@ -119,6 +119,49 @@ def _applied_versions(engine: Engine) -> set:
     return {row[0] for row in rows}
 
 
+def _looks_like_unversioned_legacy_database(engine: Engine) -> bool:
+    """
+    Lille, bevidst simpel vagt (IKKE et fuldt schema-introspektions-system):
+    hvis `schema_migrations` er tom (ingen migration er nogensinde
+    registreret som anvendt), men en af kernetabellerne fra migration 001
+    allerede findes, er databasen sandsynligvis en UNVERSIONERET database
+    fra FØR migrationssystemet blev indført.
+
+    Migration 001 bruger `CREATE TABLE IF NOT EXISTS`, så den vil IKKE fejle
+    i den situation - men den vil heller ikke opgradere en tabel med et
+    andet/ældre skema. Vi vælger at gøre dette eksplicit og synligt her, i
+    stedet for at bygge en generel legacy-migrationsmotor (se
+    docs/architecture-decisions.md).
+    """
+    with engine.connect() as conn:
+        legacy_table_exists = conn.execute(
+            text(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='ingested_files'"
+            )
+        ).fetchone()
+    return legacy_table_exists is not None
+
+
+def _warn_if_unversioned_legacy_database(engine: Engine) -> None:
+    if not _looks_like_unversioned_legacy_database(engine):
+        return
+    if _applied_versions(engine):
+        return
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "Databasen indeholder allerede tabeller (fx 'ingested_files'), men "
+        "'schema_migrations' er tom. Dette ligner en UNVERSIONERET database "
+        "fra FØR migrationssystemet blev indført - migration 001 bruger "
+        "CREATE TABLE IF NOT EXISTS og vil derfor IKKE opgradere en "
+        "eksisterende, afvigende tabelstruktur. Migrationshistorikken er "
+        "kun autoritativ fra v001 og frem. Anbefaling: slet/genskab "
+        "databasefilen, eller baseline den manuelt ved at indsætte de "
+        "rigtige rækker i schema_migrations. Se docs/architecture-decisions.md."
+    )
+
+
 def apply_migrations(engine: Engine, migrations_dir: Path = MIGRATIONS_DIR) -> List[int]:
     """
     Anvender alle migrationer der endnu ikke er registreret i
@@ -137,6 +180,7 @@ def apply_migrations(engine: Engine, migrations_dir: Path = MIGRATIONS_DIR) -> L
     from datetime import datetime, timezone
 
     _ensure_migrations_table(engine)
+    _warn_if_unversioned_legacy_database(engine)
     already_applied = _applied_versions(engine)
 
     newly_applied = []

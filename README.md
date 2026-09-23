@@ -97,11 +97,28 @@ pytest                       # kør tests
 
 ## Design-beslutninger
 
+### Terminologi: kilde-fil vs. raw-lag vs. raw_payload
+
+Disse tre begreber er bevidst forskellige, og bruges konsekvent sådan i
+dette dokument:
+
+- **Kilde-fil**: den oprindelige, uændrede fil (CSV/JSON) som den blev
+  modtaget - de rå bytes rører vi aldrig ved.
+- **Raw-laget** (`raw_meter_readings`): en FORESPØRGSELSBAR, relationel
+  repræsentation af kilde-filens rækker. Værdier er parset af pandas til
+  Python-typer og gemt som tekst-kolonner - det er IKKE en byte-for-byte
+  kopi af filen, men en landing-repræsentation der er let at joine/filtrere.
+- **`raw_payload`**: en parset række-repræsentation gemt for
+  sporbarhed/debugging - nyttig til at se "hvad så kilden ud til for denne
+  record", men er stadig pandas' fortolkning, ikke filens rå bytes.
+
 ### Hvorfor tre lag (raw / staging / analytics)?
 
-- **Raw**: bevarer data præcis som modtaget (alt gemt som tekst). Hvis vi
-  senere finder en bug i valideringslogikken, kan vi genbehandle historikken
-  uden at have mistet noget. Raw er vores "forsikring".
+- **Raw**: en forespørgselsbar landing-repræsentation af kilde-dataen, FØR
+  forretningsregler er håndhævet. Hvis vi senere finder en bug i
+  valideringslogikken, kan vi genbehandle historikken fra raw uden at have
+  mistet noget - kilde-filerne selv rører vi aldrig ved, så de forbliver
+  den ultimative sandhedskilde.
 - **Staging**: her håndhæves forretningsregler (typer, gyldighed, dubletter).
   Adskillelsen gør det muligt at teste validering isoleret fra transformation.
 - **Analytics**: et kurateret star schema optimeret til BI-værktøjer og
@@ -110,9 +127,9 @@ pytest                       # kør tests
 ### Hvorfor beholder vi rådata i stedet for kun at gemme det validerede?
 
 Fordi valideringsregler kan ændre sig, eller vise sig at have fejl. Uden
-rådata kan vi ikke gå tilbage og rette. Det er også nyttigt til debugging:
-"hvorfor blev denne record afvist?" kræver at vi kan se den oprindelige,
-ubehandlede værdi.
+raw-laget kan vi ikke gå tilbage og genbehandle historikken. Det er også
+nyttigt til debugging: "hvorfor blev denne record afvist?" kræver at vi
+kan se den oprindelige, uvaliderede værdi (via `raw_payload`/raw-laget).
 
 ### Hvorfor er database constraints (UNIQUE, CHECK) vigtige?
 
@@ -188,11 +205,12 @@ mønster BI-værktøjer som Power BI er bygget til at arbejde effektivt med
 ## Brug i Power BI
 
 `data/warehouse.db` kan tilsluttes direkte (via en SQLite-ODBC-driver) eller
-eksporteres til en SQL Server-database ved at genbruge `sql/schema.sql`
-(kun connection-strengen i `src/database.py` skal ændres). I Power BI
-importeres `dim_meter` og `fact_water_consumption`, og der oprettes en
-relation `dim_meter.meter_key = fact_water_consumption.meter_key` — det
-klassiske star schema-setup.
+migreres til en SQL Server-database (se "SQLite → SQL Server mapping"
+nedenfor for hvilke dele af koden der reelt skal tilpasses - det er IKKE
+kun et connection-string-skift). I Power BI importeres `dim_meter` og
+`fact_water_consumption`, og der oprettes en relation
+`dim_meter.meter_key = fact_water_consumption.meter_key` — det klassiske
+star schema-setup.
 
 ## SQL-øvelser
 
@@ -407,3 +425,51 @@ og connection-håndteringen skal tilpasses.
     ikke bare at `FOREIGN KEY` står i `schema.sql`. Testen forsøger at
     indsætte en fact-række med et ugyldigt `meter_key` og forventer at
     SQLite kaster en `IntegrityError`.
+
+## Known limitations / production considerations
+
+Dette projekt er bevidst afgrænset til at demonstrere kerne-koncepter klart,
+ikke til at være produktionsklar infrastruktur. Nedenstående er kendte,
+BEVIDSTE begrænsninger - formålet er at vise at de er kendte, ikke at løse
+dem ved at tilføje flere teknologier:
+
+- **Migrationssystemets baseline**: `migrations/001_initial.sql` bruger
+  `CREATE TABLE IF NOT EXISTS` og er derfor IKKE en generel
+  legacy-migrationsmotor - den opgraderer ikke en vilkårlig, allerede
+  eksisterende database med en AFVIGENDE tabelstruktur. Migrationshistorikken
+  er autoritativ fra v001 og frem. En unversioneret udviklingsdatabase fra
+  FØR migrationssystemet blev indført bør genskabes, eller eksplicit
+  baseline's manuelt (indsæt de rigtige rækker i `schema_migrations`).
+  `src/database.py` logger en advarsel hvis den opdager dette mønster
+  (tabel findes, men `schema_migrations` er tom) - det er en lille vagt,
+  ikke schema-introspektion. Se `docs/architecture-decisions.md`.
+- **Samtidighed (concurrency)**: projektet antager ÉN pipeline-proces/writer
+  ad gangen mod en lokal SQLite-fil. Fil-niveau idempotency
+  (`ingested_files.file_hash` + status) er designet til at forhindre at
+  SAMME proces genindlæser en fil, ikke til at koordinere flere samtidige
+  workers der forsøger at claim'e den samme fil parallelt. Flere samtidige
+  workers ville kræve stærkere claim-semantik (fx `SELECT ... FOR UPDATE`
+  eller en dedikeret lease/lock-mekanisme) - noget en SQL Server/cloud-baseret
+  produktionsdesign naturligt ville løse anderledes (rigtig
+  klient/server-database med radslåsning, eller en kø-baseret orkestrering).
+- **SQLite frem for SQL Server**: valgt for nul-opsætning til
+  udvikling/demo/tests - se "SQLite → SQL Server mapping" for hvad der
+  reelt skal tilpasses ved en produktions-migrering.
+- **Små, in-memory pandas-batches**: hele filer læses ind i hukommelsen med
+  pandas. Fungerer fint til dette datavolumen, men ville kræve chunking/
+  streaming til meget store filer.
+- **Ingen orkestrator/scheduler**: pipelinen køres manuelt (`python main.py`)
+  eller kunne trigges af en simpel cron-job - der er ingen Airflow/Dagster/
+  lignende. Bevidst valg for at holde projektet læsbart og afhængighedsfrit.
+- **Fast, illustrativ anomali-tærskel**: `PipelineConfig.suspicious_threshold_liters`
+  er et simpelt, statisk tal - ikke en statistisk/adaptiv anomali-detektion
+  (fx baseret på historisk standardafvigelse pr. måler).
+- **Én kilde/feed**: projektet antager én type kilde (CSV/JSON-filer med
+  samme kontrakt) - ikke flere heterogene kildesystemer eller streaming-input.
+- **Simple migrationer frem for Alembic/Flyway**: den håndrullede
+  migrationsmekanisme dækker det nødvendige (ordnet anvendelse, sporing,
+  atomicitet pr. migration), men mangler features som automatisk
+  ned-migrering (rollback), branching-håndtering eller skema-diffing som
+  modne værktøjer som Alembic/Flyway tilbyder.
+- **Antagelse om enkelt-proces-eksekvering**: se "Samtidighed" ovenfor -
+  gælder både ingestion, validation og transformation.

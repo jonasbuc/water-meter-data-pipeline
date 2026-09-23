@@ -81,3 +81,22 @@ def test_real_project_migrations_apply_cleanly():
     engine = get_engine(db_path=Path(":memory:"))
     applied = apply_migrations(engine, migrations_dir=MIGRATIONS_DIR)
     assert applied == [1, 2, 3]
+
+
+def test_unversioned_legacy_database_logs_warning_but_does_not_crash(caplog):
+    """
+    Simulerer en database fra FØR migrationssystemet: en tabel med samme navn
+    som en kernetabel findes allerede, men schema_migrations er tom.
+    Migration 001 bruger CREATE TABLE IF NOT EXISTS, så den fejler ikke -
+    men vi forventer en tydelig advarsel om at dette er en unversioneret
+    legacy-database (se docs/architecture-decisions.md).
+    """
+    engine = get_engine(db_path=Path(":memory:"))
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE ingested_files (some_old_column TEXT)"))
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        apply_migrations(engine, migrations_dir=MIGRATIONS_DIR)
+
+    assert any("unversioneret" in record.message.lower() for record in caplog.records)

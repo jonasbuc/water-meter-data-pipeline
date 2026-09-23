@@ -20,3 +20,9 @@ jobs:
 
       - name: Run tests
         run: pytest -v
+
+      - name: Run end-to-end demo smoke test
+        # Beviser at demo-stien (python main.py --demo) rent faktisk kører
+        # igennem fra en frisk checkout, uden at asserte på det printede
+        # output - formålet er blot at bevise at det ikke crasher.
+        run: python main.py --demo
