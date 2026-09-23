@@ -23,15 +23,24 @@ blive sprunget over permanent. At bruge en monoton, systemgenereret ID
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from src.config import PipelineConfig, DEFAULT_CONFIG
 from src.ingestion import ingest_directory
 from src.validation import fetch_unprocessed_raw, validate_and_load_staging
 from src.transformation import fetch_unprocessed_staging, transform_staging_to_fact
 
 logger = logging.getLogger(__name__)
+
+# De navngivne stadier en kørsel kan fejle i - bruges til FAILED-run
+# diagnostik i pipeline_runs.failed_stage (se _finish_run).
+STAGE_INGESTION = "INGESTION"
+STAGE_VALIDATION = "VALIDATION"
+STAGE_TRANSFORMATION = "TRANSFORMATION"
+STAGE_FINALIZATION = "FINALIZATION"
 
 
 def _now_iso() -> str:
@@ -83,7 +92,23 @@ def _start_run(engine: Engine) -> int:
 
 
 def _finish_run(engine: Engine, run_id: int, status: str, metrics: dict,
-                 last_processed_raw_id: int, last_processed_stg_id: int) -> None:
+                 last_processed_raw_id: int, last_processed_stg_id: int,
+                 failed_stage: Optional[str] = None, error_type: Optional[str] = None,
+                 error_message: Optional[str] = None) -> None:
+    """
+    Afslutter en pipeline_runs-række.
+
+    FAILED-run diagnostik (failed_stage/error_type/error_message): et kort,
+    operationelt sammendrag af HVOR og HVORFOR en kørsel fejlede - nok til
+    at en operatør kan se "transformation fejlede med en ValueError" uden
+    at skulle grave i logfiler for at forstå ALVOREN af fejlen. Det fulde
+    stack trace findes stadig i Python-loggeren (logger.exception), IKKE i
+    databasen - databasen skal ikke være et logging-system.
+
+    For SUCCESS-rækker sættes disse tre felter eksplicit til NULL, så en
+    tidligere fejlbesked (fra en anden kørsel) aldrig kan fremstå som om
+    den hørte til en ny, succesfuld kørsel.
+    """
     update_sql = text(
         """
         UPDATE pipeline_runs
@@ -99,7 +124,10 @@ def _finish_run(engine: Engine, run_id: int, status: str, metrics: dict,
             duplicates_skipped = :duplicates_skipped,
             facts_inserted = :facts_inserted,
             last_processed_raw_id = :last_processed_raw_id,
-            last_processed_stg_id = :last_processed_stg_id
+            last_processed_stg_id = :last_processed_stg_id,
+            failed_stage = :failed_stage,
+            error_type = :error_type,
+            error_message = :error_message
         WHERE run_id = :run_id
         """
     )
@@ -120,19 +148,24 @@ def _finish_run(engine: Engine, run_id: int, status: str, metrics: dict,
                 "facts_inserted": metrics.get("facts_inserted", 0),
                 "last_processed_raw_id": last_processed_raw_id,
                 "last_processed_stg_id": last_processed_stg_id,
+                "failed_stage": failed_stage,
+                "error_type": error_type,
+                "error_message": error_message,
                 "run_id": run_id,
             },
         )
 
 
-def run_pipeline(engine: Engine, raw_data_dir: Path) -> dict:
+def run_pipeline(engine: Engine, raw_data_dir: Path,
+                  config: PipelineConfig = DEFAULT_CONFIG) -> dict:
     """
     Kører hele pipeline'en én gang:
       1. Ingester filer i raw_data_dir -> raw_meter_readings (file-level
          idempotent: uændrede filer springes over, se ingestion.py)
       2. Validerer nye raw-rækker -> stg_meter_readings (+ data_quality_errors)
       3. Transformerer nye staging-rækker -> dim_meter / fact_water_consumption
-      4. Logger et pipeline_runs-record med status og eksplicitte tællere
+      4. Logger et pipeline_runs-record med status, stadie-diagnostik og
+         eksplicitte tællere
 
     Hvert trin (2 og 3) er sin egen atomiske transaktion (se validation.py
     og transformation.py) - IKKE én kæmpe transaktion for hele pipelinen.
@@ -140,18 +173,23 @@ def run_pipeline(engine: Engine, raw_data_dir: Path) -> dict:
     holdbart committet, og næste kørsel kan genoptage derfra (se
     _get_last_processed_ids).
 
+    `config` giver forretningsregler (fx suspicious-tærskel) videre til
+    transformation-trinnet - se src/config.py.
+
     Returnerer et summary-dict til brug i main.py / logging.
     """
     run_id = _start_run(engine)
     logger.info("Pipeline run %d startet", run_id)
 
     metrics = {}
+    current_stage = STAGE_INGESTION
     try:
         # --- Trin 1: Ingestion (file-level idempotent) ---
         ingestion_summary = ingest_directory(engine, raw_data_dir)
         metrics.update(ingestion_summary)
 
         # --- Trin 2: Incremental validation (raw -> staging), atomisk ---
+        current_stage = STAGE_VALIDATION
         last_ids = _get_last_processed_ids(engine)
         raw_df = fetch_unprocessed_raw(engine, since_raw_id=last_ids["raw_id"])
         validation_summary = validate_and_load_staging(engine, raw_df)
@@ -166,14 +204,16 @@ def run_pipeline(engine: Engine, raw_data_dir: Path) -> dict:
         metrics["duplicates_skipped"] = validation_summary["duplicates_skipped"]
 
         # --- Trin 3: Incremental transformation (staging -> analytics), atomisk ---
+        current_stage = STAGE_TRANSFORMATION
         staging_df = fetch_unprocessed_staging(engine, since_stg_id=last_ids["stg_id"])
-        inserted_facts = transform_staging_to_fact(engine, staging_df)
+        inserted_facts = transform_staging_to_fact(engine, staging_df, config=config)
 
         new_last_stg_id = (
             int(staging_df["stg_id"].max()) if not staging_df.empty else last_ids["stg_id"]
         )
         metrics["facts_inserted"] = inserted_facts
 
+        current_stage = STAGE_FINALIZATION
         _finish_run(
             engine, run_id, status="SUCCESS", metrics=metrics,
             last_processed_raw_id=new_last_raw_id,
@@ -188,10 +228,13 @@ def run_pipeline(engine: Engine, raw_data_dir: Path) -> dict:
         logger.info("Pipeline run %d fuldført: %s", run_id, summary)
         return summary
 
-    except Exception:
-        logger.exception("Pipeline run %d fejlede", run_id)
+    except Exception as exc:
+        logger.exception("Pipeline run %d fejlede i stadie %s", run_id, current_stage)
         _finish_run(
             engine, run_id, status="FAILED", metrics=metrics,
             last_processed_raw_id=0, last_processed_stg_id=0,
+            failed_stage=current_stage,
+            error_type=type(exc).__name__,
+            error_message=str(exc)[:500],  # kort operationelt sammendrag, ikke et stack trace
         )
         raise

@@ -15,15 +15,17 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 
-from src.database import get_engine, init_db, SCHEMA_PATH
+from src.database import get_engine, init_db
 
 
 @pytest.fixture
 def engine():
     # get_engine() (i stedet for create_engine direkte) sikrer at
     # PRAGMA foreign_keys=ON også er slået til for test-databasen.
+    # init_db() kører nu migrations/*.sql (se src/database.py) i stedet for
+    # at eksekvere sql/schema.sql direkte.
     test_engine = get_engine(db_path=Path(":memory:"))
-    init_db(test_engine, schema_path=SCHEMA_PATH)
+    init_db(test_engine)
     return test_engine
 
 

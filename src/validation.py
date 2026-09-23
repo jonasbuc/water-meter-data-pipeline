@@ -127,12 +127,38 @@ def validate_and_load_staging(engine: Engine, raw_df: pd.DataFrame) -> dict:
 
     processed_at = _now_iso()
 
+    # --- Skalerbarhed: batch-scoped opslag i stedet for fuld tabel-scan ---
+    # Tidligere hentede vi ALLE (meter_id, reading_timestamp)-par fra hele
+    # stg_meter_readings for hver eneste validerings-kørsel. Det betyder at
+    # arbejdet skalerede med den TOTALE historiske staging-størrelse, ikke
+    # med den aktuelle batch - jo mere historik, jo langsommere blev hver
+    # ny (lille) batch valideret.
+    #
+    # I stedet bygger vi først en liste af KANDIDAT-nøgler ud fra selve
+    # raw_df'en (de meter_id'er der rent faktisk optræder i denne batch),
+    # og slår KUN dem op i staging. Det gør arbejdet proportionalt med
+    # batch-størrelsen, ikke hele tabellen - uden at ofre læsbarhed eller
+    # indføre N+1 forespørgsler (det er stadig ét enkelt SELECT).
+    candidate_meter_ids = [
+        m for m in raw_df["meter_id"].dropna().unique().tolist()
+        if str(m).strip() not in ("", "nan", "None")
+    ]
+
     with engine.begin() as conn:
-        existing_keys = set(
-            tuple(r) for r in conn.execute(
-                text("SELECT meter_id, reading_timestamp FROM stg_meter_readings")
-            ).fetchall()
-        )
+        if candidate_meter_ids:
+            placeholders = ", ".join(f":m{i}" for i in range(len(candidate_meter_ids)))
+            params = {f"m{i}": mid for i, mid in enumerate(candidate_meter_ids)}
+            existing_keys = set(
+                tuple(r) for r in conn.execute(
+                    text(
+                        f"SELECT meter_id, reading_timestamp FROM stg_meter_readings "
+                        f"WHERE meter_id IN ({placeholders})"
+                    ),
+                    params,
+                ).fetchall()
+            )
+        else:
+            existing_keys = set()
 
         for _, row in raw_df.iterrows():
             raw_id = row["raw_id"]

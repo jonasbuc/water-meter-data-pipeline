@@ -111,7 +111,7 @@ def test_pipeline_recovers_after_transformation_failure(engine, tmp_path, monkey
         "M-001,2026-09-20T08:00:00,50.0,14.0,OK\n"
     )
 
-    def _boom(engine, staging_df):
+    def _boom(engine, staging_df, **kwargs):
         raise RuntimeError("Simuleret transformation-fejl")
 
     monkeypatch.setattr(pipeline_module, "transform_staging_to_fact", _boom)
@@ -126,12 +126,16 @@ def test_pipeline_recovers_after_transformation_failure(engine, tmp_path, monkey
         staging_count = conn.exec_driver_sql(
             "SELECT COUNT(*) FROM stg_meter_readings"
         ).fetchone()[0]
-        failed_status = conn.exec_driver_sql(
-            "SELECT status FROM pipeline_runs ORDER BY run_id DESC LIMIT 1"
-        ).fetchone()[0]
+        failed_run = conn.exec_driver_sql(
+            "SELECT status, failed_stage, error_type, error_message "
+            "FROM pipeline_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
 
     assert staging_count == 1  # staging blev committet trods senere fejl
-    assert failed_status == "FAILED"
+    assert failed_run[0] == "FAILED"
+    assert failed_run[1] == "TRANSFORMATION"
+    assert failed_run[2] == "RuntimeError"
+    assert "Simuleret transformation-fejl" in failed_run[3]
 
     monkeypatch.undo()  # gendan den rigtige transform_staging_to_fact
 
@@ -144,7 +148,16 @@ def test_pipeline_recovers_after_transformation_failure(engine, tmp_path, monkey
         staging_count_after = conn.exec_driver_sql(
             "SELECT COUNT(*) FROM stg_meter_readings"
         ).fetchone()[0]
+        success_run = conn.exec_driver_sql(
+            "SELECT status, failed_stage, error_type, error_message "
+            "FROM pipeline_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
 
     assert recovery_summary["status"] == "SUCCESS"
     assert fact_count == 1          # den staging-række der ventede blev nu transformeret
     assert staging_count_after == 1  # ingen duplikeret staging-række
+    # SUCCESS-rækker må ALDRIG bære en gammel fejlbesked videre
+    assert success_run[0] == "SUCCESS"
+    assert success_run[1] is None
+    assert success_run[2] is None
+    assert success_run[3] is None

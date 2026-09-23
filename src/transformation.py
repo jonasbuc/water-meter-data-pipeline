@@ -21,13 +21,14 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from src.config import PipelineConfig, DEFAULT_CONFIG
+
 logger = logging.getLogger(__name__)
 
-# Simpel regel for "usædvanligt højt forbrug": alt over denne grænse (liter
-# pr. måling) flages som suspicious. I et rigtigt projekt ville denne
-# grænse nok være statistisk (fx X standardafvigelser over målerens eget
-# gennemsnit) - her holder vi den bevidst simpel til læringsformål.
-SUSPICIOUS_THRESHOLD_LITERS = 2000.0
+# Bevaret for bagudkompatibilitet (fx eksisterende tests der importerer
+# konstanten direkte). Den REELLE konfiguration bør nu ske via
+# PipelineConfig (src/config.py) - se transform_staging_to_fact.
+SUSPICIOUS_THRESHOLD_LITERS = DEFAULT_CONFIG.suspicious_threshold_liters
 
 
 def _now_iso() -> str:
@@ -130,10 +131,16 @@ def upsert_dim_meter(conn, meter_ids: list, min_ts_by_meter: dict, max_ts_by_met
     return {row.meter_id: row.meter_key for row in refreshed}
 
 
-def transform_staging_to_fact(engine: Engine, staging_df: pd.DataFrame) -> int:
+def transform_staging_to_fact(engine: Engine, staging_df: pd.DataFrame,
+                               config: PipelineConfig = DEFAULT_CONFIG) -> int:
     """
     Transformerer staging-rækker til fact_water_consumption + opdaterer dim_meter.
     Bruger INSERT OR IGNORE for idempotency (samme grund som i staging-trinnet).
+
+    `config` (PipelineConfig) holder FORRETNINGSREGLER som
+    suspicious_threshold_liters adskilt fra selve transformations-koden -
+    se src/config.py for hvorfor. Tests kan nemt levere deres egen
+    PipelineConfig med en anden tærskel.
 
     Transaktionsgrænse (atomicity): dimension-upsert og fact-indsættelse sker
     i ÉN transaktion. De hører logisk sammen som ét pipeline-trin
@@ -157,7 +164,7 @@ def transform_staging_to_fact(engine: Engine, staging_df: pd.DataFrame) -> int:
 
         rows = []
         for _, row in staging_df.iterrows():
-            is_suspicious = 1 if row["consumption_liters"] > SUSPICIOUS_THRESHOLD_LITERS else 0
+            is_suspicious = 1 if row["consumption_liters"] > config.suspicious_threshold_liters else 0
             rows.append(
                 {
                     "meter_key": int(meter_key_map[row["meter_id"]]),

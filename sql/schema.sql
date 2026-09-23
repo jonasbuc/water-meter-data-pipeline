@@ -1,8 +1,17 @@
 -- =========================================================
--- SCHEMA: Vandmåler Data Pipeline
+-- SCHEMA: Vandmåler Data Pipeline (REFERENCE ONLY)
 -- Lag: RAW -> STAGING -> ANALYTICS
--- Designet til SQLite, men bevidst skrevet så det er let at
--- portere til SQL Server (se README.md -> "SQLite -> SQL Server mapping").
+--
+-- VIGTIGT: Denne fil køres IKKE længere af koden. Den er et
+-- menneskelæsbart snapshot af det fulde, aktuelle skema. Den autoritative
+-- kilde til sandhed er migrations/*.sql, anvendt via src/database.py
+-- (apply_migrations). Hold denne fil synkroniseret manuelt når du
+-- tilføjer en ny migration, men lad ALDRIG denne fil og migrations/
+-- modsige hinanden - se docs/architecture-decisions.md.
+--
+-- Designet til SQLite, men bevidst skrevet så det er let at forstå
+-- forskellene til SQL Server (se README.md -> "SQLite -> SQL Server
+-- mapping" for hvorfor det IKKE kun er et connection-string-skift).
 -- =========================================================
 
 -- ---------------------------------------------------------
@@ -27,7 +36,8 @@ CREATE TABLE IF NOT EXISTS ingested_files (
     first_seen_at       TEXT NOT NULL,
     processed_at        TEXT,
     row_count           INTEGER DEFAULT 0,
-    status              TEXT NOT NULL DEFAULT 'PENDING'  -- PENDING / PROCESSED / FAILED
+    status              TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING', 'PROCESSED', 'FAILED'))
 );
 
 -- ---------------------------------------------------------
@@ -100,7 +110,8 @@ CREATE TABLE IF NOT EXISTS data_quality_errors (
     meter_id            TEXT,
     reading_timestamp   TEXT,
     error_type          TEXT NOT NULL,    -- fx 'MISSING_METER_ID', 'NEGATIVE_CONSUMPTION'
-    severity            TEXT NOT NULL DEFAULT 'ERROR',  -- ERROR / WARNING
+    severity            TEXT NOT NULL DEFAULT 'ERROR'
+        CHECK (severity IN ('ERROR', 'WARNING')),
     error_detail        TEXT,
     source_file         TEXT,
     detected_at         TEXT NOT NULL,
@@ -143,7 +154,8 @@ CREATE TABLE IF NOT EXISTS fact_water_consumption (
     consumption_liters  REAL NOT NULL,
     temperature         REAL,
     status              TEXT,
-    is_suspicious       INTEGER NOT NULL DEFAULT 0,  -- 0/1 boolean (SQL Server: BIT)
+    is_suspicious       INTEGER NOT NULL DEFAULT 0
+        CHECK (is_suspicious IN (0, 1)),  -- 0/1 boolean (SQL Server: BIT)
 
     FOREIGN KEY (meter_key) REFERENCES dim_meter (meter_key),
     FOREIGN KEY (source_stg_id) REFERENCES stg_meter_readings (stg_id),
@@ -159,7 +171,8 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     run_id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     start_time              TEXT NOT NULL,
     end_time                TEXT,
-    status                  TEXT NOT NULL DEFAULT 'RUNNING',  -- RUNNING / SUCCESS / FAILED
+    status                  TEXT NOT NULL DEFAULT 'RUNNING'
+        CHECK (status IN ('RUNNING', 'SUCCESS', 'FAILED')),
 
     files_discovered        INTEGER DEFAULT 0,  -- filer fundet i kildemappen denne kørsel
     files_ingested          INTEGER DEFAULT 0,  -- filer der reelt blev læst ind (ny hash)
@@ -178,5 +191,29 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     -- database-genererede ID'er (ikke kilde-timestamps) som vandmærke.
     -- Se forklaring i src/pipeline.py for hvorfor.
     last_processed_raw_id  INTEGER DEFAULT 0,
-    last_processed_stg_id  INTEGER DEFAULT 0
+    last_processed_stg_id  INTEGER DEFAULT 0,
+
+    -- FAILED-run diagnostik (migration 003): et kort operationelt
+    -- sammendrag af HVOR og HVORFOR en kørsel fejlede. Fulde stack traces
+    -- hører til i Python-loggeren, ikke i databasen.
+    failed_stage            TEXT,   -- INGESTION / VALIDATION / TRANSFORMATION / FINALIZATION
+    error_type               TEXT,   -- exception class name, fx 'ValueError'
+    error_message            TEXT    -- kort, menneskelæsbar fejlbesked
 );
+
+-- ---------------------------------------------------------
+-- INDEXES (migration 002)
+-- Se docs/architecture-decisions.md og sql/query_plan_examples.sql for
+-- hvilke queries hver af disse understøtter, og hvorfor vi IKKE
+-- indekserer alt.
+-- ---------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_raw_meter_readings_file_id
+    ON raw_meter_readings (file_id);
+CREATE INDEX IF NOT EXISTS idx_stg_meter_readings_raw_id
+    ON stg_meter_readings (raw_id);
+CREATE INDEX IF NOT EXISTS idx_fact_water_consumption_source_stg_id
+    ON fact_water_consumption (source_stg_id);
+CREATE INDEX IF NOT EXISTS idx_fact_water_consumption_reading_timestamp
+    ON fact_water_consumption (reading_timestamp);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status
+    ON pipeline_runs (status);

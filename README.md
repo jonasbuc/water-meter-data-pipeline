@@ -61,24 +61,37 @@ src/
   pipeline.py               # orkestrering, logging, incremental load, recovery
 
 sql/
-  schema.sql               # alle tabeller
+  schema.sql               # REFERENCE ONLY snapshot - se migrations/ for den autoritative kilde
   analytics_queries.sql    # SQL-øvelser + lineage/debugging + pipeline health
+  query_plan_examples.sql  # EXPLAIN QUERY PLAN-beviser for indexing-strategien
+
+migrations/
+  001_initial.sql          # autoritativt, konsolideret start-skema
+  002_add_indexes.sql      # bevidst indexing-strategi
+  003_add_pipeline_failure_diagnostics.sql  # FAILED-run observability
+
+docs/
+  architecture-decisions.md  # ADR-001..008: kort Context/Decision/Trade-off
 
 tests/
   test_validation.py
   test_transformation.py
   test_pipeline_incremental.py
   test_lineage_and_constraints.py
+  test_migrations.py
+  test_ingestion_atomicity.py
+  test_config_and_constraints.py
 
 .github/workflows/tests.yml # CI: kører pytest på push/PR
 
-main.py                    # kør hele pipeline'en
+main.py                    # kør hele pipeline'en, eller `--demo` for en selvstændig demo
 ```
 
 ## Sådan kører du det
 
 ```bash
-python main.py              # kør pipeline
+python main.py              # kør pipeline mod data/warehouse.db
+python main.py --demo       # kør en selvstændig demo mod en frisk data/demo.db
 pytest                       # kør tests
 ```
 
@@ -259,6 +272,50 @@ Kort, i almindeligt sprog - de begreber dette projekt er bygget til at vise:
 - **Power BI som konsumtionslag**: analytics-laget (`dim_meter` +
   `fact_water_consumption`) er designet til at blive importeret direkte
   i et BI-værktøj med en simpel star schema-relation.
+
+## Domæneantagelse: interval- vs. kumulativt forbrug
+
+Vandmålerdata kan i praksis se ud på to fundamentalt forskellige måder, og
+det er en stiltiende, men KRITISK antagelse hvilken af de to man arbejder med:
+
+- **Interval-forbrug** (antagelsen i dette projekt): hver record er
+  ALLEREDE forbruget i en given periode (fx "12.4 liter denne time").
+  Her er `SUM(consumption_liters)` korrekt for at få totalt forbrug.
+- **Kumulativ tælleraflæsning**: hver record er målerens akkumulerede
+  totaltal siden installation (fx "1234.5 liter i alt"). Her ville
+  `SUM(consumption_liters)` give et absurd, alt for stort resultat -
+  forbrug skal i stedet udledes som differencen mellem på hinanden
+  følgende aflæsninger.
+
+Eksempel på hvordan kumulativt forbrug SKAL beregnes (til sammenligning
+med den simple `SUM()` vi bruger nu):
+
+```sql
+-- Antaget kumulativ model (IKKE hvordan dette projekt fungerer i dag):
+SELECT
+    meter_id,
+    reading_timestamp,
+    consumption_liters AS cumulative_reading,
+    consumption_liters - LAG(consumption_liters) OVER (
+        PARTITION BY meter_id ORDER BY reading_timestamp
+    ) AS derived_interval_consumption
+FROM fact_water_consumption;
+```
+
+Denne tilgang har egne faldgruber der IKKE er relevante for interval-modellen:
+
+- **Målerskift**: en ny fysisk måler starter typisk fra 0 -> en naiv
+  difference ville give en kæmpe negativ værdi.
+- **Counter rollover**: nogle målere "ruller rundt" til 0 ved et maksimum
+  (fx en 16-bit tæller) -> en naiv difference ville også her blive negativ.
+- **Manglende/forsinkede aflæsninger**: hvis en aflæsning mangler, dækker
+  differencen mellem de to omkringliggende aflæsninger en LÆNGERE periode
+  end forventet, hvilket kan sløre analyser pr. dag/time.
+
+Da dette projekt eksplicit antager interval-modellen, er ingen af disse
+korrektioner implementeret - men det er vigtigt at kunne redegøre for
+hvorfor `SUM()` er korrekt HER, og hvornår det IKKE ville være det.
+Se `docs/architecture-decisions.md` (ADR-008) for beslutningen i kort form.
 
 ## SQLite → SQL Server mapping
 
