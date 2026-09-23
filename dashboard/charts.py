@@ -1,13 +1,17 @@
 """
 dashboard/charts.py
---------------------
-Genbrugelige Plotly-chart-byggere. Holder `app.py` fokuseret på layout og
-sidebar-logik, mens al chart-konfiguration (farver, titler, labels) samles
-ét sted for konsistens - samme princip som at holde SQL ét sted i data.py.
+-------------------
+Polerede, genbrugelige Plotly-chart builders til BI-dashboardet.
 
-Alle funktioner tager et pandas DataFrame og returnerer en Plotly Figure -
-ingen af dem rører databasen.
+Målet er et roligt Power BI-lignende udtryk:
+- ensartede akser, gridlines og hover labels
+- tydelig visuel prioritering
+- ingen neonfarver eller 3D/gauge-gimmicks
+- anomalies/ERROR bruger accentfarver sparsomt
+- funktionerne er rene: DataFrame ind -> Figure ud
 """
+
+from __future__ import annotations
 
 from typing import Optional
 
@@ -15,191 +19,477 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Restrained, professionelt farve-tema - undgår neon-farver og "gauge"-stil.
-PRIMARY_COLOR = "#1f6feb"
-SUSPICIOUS_COLOR = "#d1242f"
-NORMAL_COLOR = "#1f6feb"
-SEVERITY_COLORS = {"ERROR": "#d1242f", "WARNING": "#d4a72c"}
 
-def _apply_default_layout(fig: go.Figure, title: Optional[str] = None,
-                           xaxis_title: Optional[str] = None,
-                           yaxis_title: Optional[str] = None) -> go.Figure:
-    """
-    Anvender det fælles, restrained layout-tema (hvid baggrund, kompakte
-    margener, ensartet skriftstørrelse) på en figur. Skrevet med
-    eksplicitte parametre i stedet for `fig.update_layout(**some_dict)`,
-    fordi Plotly's type-stubs gør bred `**dict`-unpacking tvetydig for
-    statiske type-checkere (falsk positiv, ikke en reel runtime-fejl).
-    """
+# ---------------------------------------------------------------------------
+# Design tokens
+# ---------------------------------------------------------------------------
+
+NAVY = "#102A43"
+BLUE = "#2F80ED"
+BLUE_LIGHT = "#EAF2FF"
+CYAN = "#56CCF2"
+TEAL = "#2BB3A3"
+GREEN = "#27AE60"
+AMBER = "#D9A441"
+RED = "#D95C5C"
+PURPLE = "#7B61FF"
+
+TEXT = "#1B2B3A"
+MUTED = "#6B7C93"
+GRID = "#EEF2F6"
+BORDER = "#E1E8F0"
+SURFACE = "#FFFFFF"
+PLOT_BG = "rgba(0,0,0,0)"
+
+SERIES = [BLUE, TEAL, PURPLE, AMBER, CYAN, GREEN]
+SEVERITY_COLORS = {"ERROR": RED, "WARNING": AMBER}
+
+# Titles are rendered by the surrounding card in app.py, not inside the
+# figure itself, so charts never show a duplicated heading.
+
+
+def _apply_default_layout(
+    fig: go.Figure,
+    *,
+    title: Optional[str] = None,
+    xaxis_title: Optional[str] = None,
+    yaxis_title: Optional[str] = None,
+    height: int = 340,
+    showlegend: Optional[bool] = None,
+) -> go.Figure:
+    """Shared, restrained BI look for every figure. Backgrounds are
+    transparent so the chart visually belongs to the surrounding card
+    rather than owning its own surface."""
     fig.update_layout(
         template="plotly_white",
-        margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(size=13),
-        title=title,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=height,
+        margin=dict(l=8, r=8, t=10, b=8),
+        font=dict(
+            family="Inter, Segoe UI, Arial, sans-serif",
+            size=12,
+            color=TEXT,
+        ),
         xaxis_title=xaxis_title,
         yaxis_title=yaxis_title,
+        hoverlabel=dict(
+            bgcolor="#FFFFFF",
+            bordercolor=BORDER,
+            font=dict(color=TEXT, size=12),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            title_text="",
+            font=dict(size=11, color=MUTED),
+        ),
+        showlegend=showlegend,
+    )
+
+    fig.update_xaxes(
+        showgrid=False,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont=dict(color=MUTED),
+        title_font=dict(color=MUTED, size=11),
+        automargin=True,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor=GRID,
+        gridwidth=1,
+        zeroline=False,
+        linecolor=BORDER,
+        tickfont=dict(color=MUTED),
+        title_font=dict(color=MUTED, size=11),
+        automargin=True,
     )
     return fig
 
 
 def consumption_over_time_chart(df: pd.DataFrame) -> go.Figure:
-    """Linjegraf: samlet forbrug pr. dag."""
+    """Samlet dagligt forbrug med diskret area-fill."""
     if df.empty:
-        return _empty_figure("Intet forbrug at vise for de valgte filtre")
-    fig = px.line(
-        df, x="reading_date", y="total_liters",
-        markers=True,
-        labels={"reading_date": "Dato", "total_liters": "Forbrug (L)"},
+        return _empty_figure("No consumption data for the selected filters")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["reading_date"],
+            y=df["total_liters"],
+            mode="lines",
+            name="Consumption",
+            line=dict(color=BLUE, width=2.5, shape="spline", smoothing=0.3),
+            fill="tozeroy",
+            fillcolor="rgba(47, 128, 237, 0.08)",
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>%{y:,.0f} L<extra></extra>",
+        )
     )
-    fig.update_traces(line_color=PRIMARY_COLOR, hovertemplate="%{x|%Y-%m-%d}<br>%{y:,.0f} L")
-    return _apply_default_layout(fig, title="Water consumption over time")
+
+    return _apply_default_layout(
+        fig,
+        yaxis_title="Litres",
+        height=360,
+        showlegend=False,
+    )
 
 
 def consumption_over_time_by_meter_chart(df: pd.DataFrame) -> go.Figure:
-    """Linjegraf: forbrug pr. dag, opdelt pr. måler."""
+    """Dagligt forbrug opdelt pr. måler."""
     if df.empty:
-        return _empty_figure("Intet forbrug at vise for de valgte filtre")
+        return _empty_figure("No consumption data for the selected filters")
+
     fig = px.line(
-        df, x="reading_date", y="total_liters", color="meter_id",
-        markers=True,
-        labels={"reading_date": "Dato", "total_liters": "Forbrug (L)", "meter_id": "Måler"},
+        df,
+        x="reading_date",
+        y="total_liters",
+        color="meter_id",
+        color_discrete_sequence=SERIES,
+        markers=False,
+        labels={
+            "reading_date": "",
+            "total_liters": "Litres",
+            "meter_id": "Meter",
+        },
     )
-    return _apply_default_layout(fig, title="Water consumption over time (by meter)")
+    fig.update_traces(
+        line=dict(width=2.2),
+        hovertemplate="<b>%{fullData.name}</b><br>%{x|%d %b %Y}<br>%{y:,.0f} L<extra></extra>",
+    )
+
+    return _apply_default_layout(
+        fig,
+        yaxis_title="Litres",
+        height=360,
+        showlegend=True,
+    )
 
 
 def top_meters_chart(df: pd.DataFrame) -> go.Figure:
-    """Horisontal søjlediagram: top-N målere efter samlet forbrug."""
+    """Top-N målere med kompakt horisontal bar chart."""
     if df.empty:
-        return _empty_figure("Ingen målerdata for de valgte filtre")
-    df_sorted = df.sort_values("total_liters", ascending=True)
-    fig = px.bar(
-        df_sorted, x="total_liters", y="meter_id", orientation="h",
-        labels={"total_liters": "Samlet forbrug (L)", "meter_id": "Måler"},
-        text="total_liters",
+        return _empty_figure("No meter data for the selected filters")
+
+    plot_df = df.sort_values("total_liters", ascending=True).copy()
+    max_val = plot_df["total_liters"].max()
+    bar_colors = [BLUE if v < max_val else NAVY for v in plot_df["total_liters"]]
+
+    fig = go.Figure(
+        go.Bar(
+            x=plot_df["total_liters"],
+            y=plot_df["meter_id"],
+            orientation="h",
+            marker=dict(color=bar_colors, cornerradius=4),
+            text=plot_df["total_liters"],
+            texttemplate="%{text:,.0f} L",
+            textposition="outside",
+            textfont=dict(size=11, color=MUTED),
+            cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>%{x:,.0f} L<extra></extra>",
+        )
     )
-    fig.update_traces(
-        marker_color=PRIMARY_COLOR,
-        texttemplate="%{text:,.0f} L",
-        textposition="outside",
+
+    fig = _apply_default_layout(
+        fig,
+        xaxis_title="Litres",
+        height=310,
+        showlegend=False,
     )
-    return _apply_default_layout(fig, title="Top meters by total consumption")
+    fig.update_yaxes(showgrid=False)
+    fig.update_xaxes(showgrid=True, gridcolor=GRID)
+    return fig
 
 
 def status_breakdown_chart(df: pd.DataFrame) -> go.Figure:
-    """Søjlediagram: antal målinger pr. status."""
+    """Statusmix som donut; bedre egnet end bars når kategorierne udgør ét samlet antal."""
     if df.empty:
-        return _empty_figure("Ingen status-data for de valgte filtre")
-    fig = px.bar(
-        df, x="status", y="reading_count",
-        labels={"status": "Status", "reading_count": "Antal målinger"},
-        text="reading_count",
+        return _empty_figure("No status data for the selected filters")
+
+    colors = SERIES[: max(len(df), 1)]
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=df["status"],
+                values=df["reading_count"],
+                hole=0.72,
+                sort=False,
+                marker=dict(colors=colors, line=dict(color="#FFFFFF", width=2)),
+                textinfo="percent",
+                textfont=dict(size=11, color=TEXT),
+                hovertemplate="<b>%{label}</b><br>%{value:,} readings<br>%{percent}<extra></extra>",
+            )
+        ]
     )
-    fig.update_traces(marker_color=PRIMARY_COLOR, textposition="outside")
-    return _apply_default_layout(fig, title="Readings by status")
+
+    total = int(df["reading_count"].sum())
+    fig.add_annotation(
+        x=0.5,
+        y=0.5,
+        text=f"<b>{total:,}</b><br><span style='font-size:10px;color:{MUTED}'>readings</span>",
+        showarrow=False,
+        align="center",
+        font=dict(size=18, color=NAVY),
+    )
+
+    return _apply_default_layout(
+        fig,
+        height=300,
+        showlegend=True,
+    )
 
 
 def meter_time_series_chart(df: pd.DataFrame, meter_id: str) -> go.Figure:
-    """
-    Linjegraf for én målers forbrug over tid, med mistænkelige målinger
-    markeret som separate, fremhævede punkter (ikke bare en anden
-    linjefarve, for tydelighed).
-    """
+    """Forbrug for én måler, med anomalies som tydelige men kontrollerede highlights."""
     if df.empty:
-        return _empty_figure(f"Ingen målinger for måler {meter_id}")
-    df_sorted = df.sort_values("reading_timestamp")
+        return _empty_figure(f"No readings for meter {meter_id}")
+
+    plot_df = df.sort_values("reading_timestamp").copy()
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df_sorted["reading_timestamp"], y=df_sorted["consumption_liters"],
-        mode="lines+markers", name="Consumption",
-        line=dict(color=NORMAL_COLOR),
-        hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:,.1f} L",
-    ))
-    suspicious_df = df_sorted[df_sorted["is_suspicious"] == 1]
-    if not suspicious_df.empty:
-        fig.add_trace(go.Scatter(
-            x=suspicious_df["reading_timestamp"], y=suspicious_df["consumption_liters"],
-            mode="markers", name="Suspicious reading",
-            marker=dict(color=SUSPICIOUS_COLOR, size=11, symbol="diamond"),
-            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:,.1f} L (suspicious)",
-        ))
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["reading_timestamp"],
+            y=plot_df["consumption_liters"],
+            mode="lines",
+            name="Consumption",
+            line=dict(color=BLUE, width=2.4),
+            fill="tozeroy",
+            fillcolor="rgba(47, 128, 237, 0.06)",
+            hovertemplate="%{x|%d %b %Y %H:%M}<br><b>%{y:,.1f} L</b><extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["reading_timestamp"],
+            y=plot_df["consumption_liters"],
+            mode="markers",
+            name="Reading",
+            marker=dict(size=5, color=BLUE, opacity=0.65),
+            hovertemplate="%{x|%d %b %Y %H:%M}<br><b>%{y:,.1f} L</b><extra></extra>",
+        )
+    )
+
+    suspicious = plot_df[plot_df["is_suspicious"] == 1]
+    if not suspicious.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=suspicious["reading_timestamp"],
+                y=suspicious["consumption_liters"],
+                mode="markers",
+                name="Threshold exceeded",
+                marker=dict(
+                    color=RED,
+                    size=11,
+                    symbol="diamond",
+                    line=dict(color="#FFFFFF", width=2),
+                ),
+                hovertemplate=(
+                    "<b>Threshold exceeded</b><br>"
+                    "%{x|%d %b %Y %H:%M}<br>%{y:,.1f} L<extra></extra>"
+                ),
+            )
+        )
+
     return _apply_default_layout(
-        fig, title=f"Consumption over time — {meter_id}",
-        xaxis_title="Timestamp", yaxis_title="Consumption (L)",
+        fig,
+        xaxis_title="",
+        yaxis_title="Litres",
+        height=380,
+        showlegend=True,
     )
 
 
 def meter_temperature_chart(df: pd.DataFrame, meter_id: str) -> Optional[go.Figure]:
-    """
-    Separat temperatur-graf (IKKE dual-axis - se README/opgave-krav om at
-    undgå forvirrende dobbelt-akse-grafer uden stærk grund). Returnerer
-    None hvis temperatur mangler helt for denne måler.
-    """
-    temp_df = df.dropna(subset=["temperature"])
+    """Separat temperaturserie — ingen dual-axis."""
+    temp_df = df.dropna(subset=["temperature"]).sort_values("reading_timestamp")
     if temp_df.empty:
         return None
-    temp_df_sorted = temp_df.sort_values("reading_timestamp")
-    fig = px.line(
-        temp_df_sorted, x="reading_timestamp", y="temperature", markers=True,
-        labels={"reading_timestamp": "Timestamp", "temperature": "Temperature (°C)"},
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=temp_df["reading_timestamp"],
+            y=temp_df["temperature"],
+            mode="lines",
+            name="Temperature",
+            line=dict(color=TEAL, width=2.2),
+            fill="tozeroy",
+            fillcolor="rgba(43, 179, 163, 0.07)",
+            hovertemplate="%{x|%d %b %Y %H:%M}<br><b>%{y:.1f} °C</b><extra></extra>",
+        )
     )
-    fig.update_traces(line_color="#9a6700")
-    return _apply_default_layout(fig, title=f"Temperature over time — {meter_id}")
+    return _apply_default_layout(
+        fig,
+        yaxis_title="°C",
+        height=260,
+        showlegend=False,
+    )
 
 
 def quality_issues_by_type_chart(df: pd.DataFrame) -> go.Figure:
+    """Kvalitetsproblemer rangordnet efter antal."""
     if df.empty:
-        return _empty_figure("Ingen datakvalitetsfejl registreret")
-    df_sorted = df.sort_values("issue_count", ascending=True)
-    fig = px.bar(
-        df_sorted, x="issue_count", y="error_type", orientation="h",
-        labels={"issue_count": "Antal", "error_type": "Fejltype"},
-        text="issue_count",
+        return _empty_figure("No data quality issues recorded")
+
+    plot_df = df.sort_values("issue_count", ascending=True).copy()
+
+    fig = go.Figure(
+        go.Bar(
+            x=plot_df["issue_count"],
+            y=plot_df["error_type"],
+            orientation="h",
+            marker=dict(color=RED, opacity=0.88, cornerradius=5),
+            text=plot_df["issue_count"],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>%{x:,} issues<extra></extra>",
+        )
     )
-    fig.update_traces(marker_color=PRIMARY_COLOR, textposition="outside")
-    return _apply_default_layout(fig, title="Issues by type")
+
+    fig = _apply_default_layout(
+        fig,
+        xaxis_title="Issues",
+        height=300,
+        showlegend=False,
+    )
+    fig.update_yaxes(showgrid=False)
+    return fig
 
 
 def quality_severity_donut_chart(df: pd.DataFrame) -> go.Figure:
     if df.empty:
-        return _empty_figure("Ingen datakvalitetsfejl registreret")
-    colors = [SEVERITY_COLORS.get(s, "#8b949e") for s in df["severity"]]
-    fig = go.Figure(data=[go.Pie(
-        labels=df["severity"], values=df["issue_count"], hole=0.55,
-        marker=dict(colors=colors),
-    )])
-    return _apply_default_layout(fig, title="Severity split")
+        return _empty_figure("No data quality issues recorded")
+
+    colors = [SEVERITY_COLORS.get(str(s), MUTED) for s in df["severity"]]
+    total = int(df["issue_count"].sum())
+
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=df["severity"],
+                values=df["issue_count"],
+                hole=0.72,
+                marker=dict(colors=colors, line=dict(color="#FFFFFF", width=2)),
+                textinfo="none",
+                hovertemplate="<b>%{label}</b><br>%{value:,} issues<br>%{percent}<extra></extra>",
+            )
+        ]
+    )
+    fig.add_annotation(
+        x=0.5,
+        y=0.5,
+        text=f"<b>{total:,}</b><br><span style='font-size:10px;color:{MUTED}'>issues</span>",
+        showarrow=False,
+        font=dict(size=18, color=NAVY),
+    )
+
+    return _apply_default_layout(
+        fig,
+        height=300,
+        showlegend=True,
+    )
+
+
+def pipeline_stage_flow_chart(stages: "list[tuple[str, int]]") -> go.Figure:
+    """Compact horizontal stage-progression bars, used when there is only
+    a single pipeline run and a run-history chart would not be meaningful."""
+    if not stages:
+        return _empty_figure("No pipeline runs recorded")
+
+    labels = [s[0] for s in stages][::-1]
+    values = [s[1] for s in stages][::-1]
+    colors = [BLUE, TEAL, AMBER, PURPLE][: len(stages)][::-1]
+
+    fig = go.Figure(
+        go.Bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            marker=dict(color=colors, cornerradius=4),
+            text=values,
+            texttemplate="%{text:,}",
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>%{x:,} rows<extra></extra>",
+        )
+    )
+    fig = _apply_default_layout(
+        fig,
+        xaxis_title="Rows",
+        height=260,
+        showlegend=False,
+    )
+    fig.update_yaxes(showgrid=False)
+    return fig
 
 
 def pipeline_run_metrics_chart(df: pd.DataFrame) -> go.Figure:
-    """
-    Søjlediagram over centrale rækketal pr. kørsel. Bevidst begrænset til
-    et lille sæt sammenlignelige metrikker (rå/staging/fact) - blander IKKE
-    fx duplicates_skipped ind, som ville gøre skalaen misvisende.
-    """
+    """Run-history bars, only meaningful once more than one run exists."""
     if df.empty:
-        return _empty_figure("Ingen pipeline-kørsler registreret endnu")
-    metrics = ["raw_rows_ingested", "staging_rows_inserted", "staging_rows_rejected", "facts_inserted"]
-    plot_df = df[["run_id"] + metrics].melt(
-        id_vars="run_id", var_name="metric", value_name="count"
+        return _empty_figure("No pipeline runs recorded")
+
+    metrics = {
+        "raw_rows_ingested": ("Raw ingested", BLUE),
+        "staging_rows_inserted": ("Accepted", TEAL),
+        "staging_rows_rejected": ("Rejected", RED),
+        "facts_inserted": ("Published", PURPLE),
+    }
+
+    fig = go.Figure()
+    for key, (label, color) in metrics.items():
+        if key not in df.columns:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=df["run_id"].astype(str),
+                y=df[key],
+                name=label,
+                mode="lines+markers",
+                line=dict(color=color, width=2.2),
+                marker=dict(size=6, color=color),
+                hovertemplate=f"<b>{label}</b><br>Run %{{x}}<br>%{{y:,}} rows<extra></extra>",
+            )
+        )
+
+    return _apply_default_layout(
+        fig,
+        xaxis_title="Run",
+        yaxis_title="Rows",
+        height=320,
+        showlegend=True,
     )
-    fig = px.bar(
-        plot_df, x="run_id", y="count", color="metric", barmode="group",
-        labels={"run_id": "Run ID", "count": "Rows", "metric": "Metric"},
-    )
-    return _apply_default_layout(fig, title="Rows processed by pipeline run")
 
 
 def _empty_figure(message: str) -> go.Figure:
-    """Ensartet, læsbar "ingen data"-tilstand i stedet for en blank/broken chart."""
+    """Rolig tomtilstand, der stadig ligner resten af dashboardet."""
     fig = go.Figure()
     fig.add_annotation(
-        text=message, xref="paper", yref="paper", x=0.5, y=0.5,
-        showarrow=False, font=dict(size=14, color="#57606a"),
+        text=f"<b>{message}</b>",
+        xref="paper",
+        yref="paper",
+        x=0.5,
+        y=0.52,
+        showarrow=False,
+        font=dict(size=13, color=MUTED),
+    )
+    fig.add_annotation(
+        text="Adjust the filters or run the pipeline to populate this view.",
+        xref="paper",
+        yref="paper",
+        x=0.5,
+        y=0.42,
+        showarrow=False,
+        font=dict(size=11, color="#9AA8B6"),
     )
     fig.update_layout(
-        template="plotly_white",
-        margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(size=13),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=260,
+        margin=dict(l=18, r=18, t=18, b=18),
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
     )
