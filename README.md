@@ -440,9 +440,12 @@ dem ved at tilføje flere teknologier:
   er autoritativ fra v001 og frem. En unversioneret udviklingsdatabase fra
   FØR migrationssystemet blev indført bør genskabes, eller eksplicit
   baseline's manuelt (indsæt de rigtige rækker i `schema_migrations`).
-  `src/database.py` logger en advarsel hvis den opdager dette mønster
-  (tabel findes, men `schema_migrations` er tom) - det er en lille vagt,
-  ikke schema-introspektion. Se `docs/architecture-decisions.md`.
+  `src/database.py` **fejler hurtigt** (rejser
+  `UnversionedLegacyDatabaseError`) hvis den opdager dette mønster (tabel
+  findes, men `schema_migrations` er tom) - det er en lille vagt, ikke
+  schema-introspektion. Det er en bevidst beslutning: det er SIKRERE at
+  afvise et ukendt skema end at markere en inkompatibel database som
+  succesfuldt migreret. Se `docs/architecture-decisions.md`.
 - **Samtidighed (concurrency)**: projektet antager ÉN pipeline-proces/writer
   ad gangen mod en lokal SQLite-fil. Fil-niveau idempotency
   (`ingested_files.file_hash` + status) er designet til at forhindre at

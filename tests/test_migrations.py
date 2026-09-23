@@ -6,9 +6,15 @@ Tester den lille migrationsmekanisme i src/database.py.
 
 from pathlib import Path
 
+import pytest
 from sqlalchemy import text
 
-from src.database import get_engine, apply_migrations, MIGRATIONS_DIR
+from src.database import (
+    get_engine,
+    apply_migrations,
+    MIGRATIONS_DIR,
+    UnversionedLegacyDatabaseError,
+)
 
 
 def test_empty_database_upgrades_to_latest_version():
@@ -83,20 +89,33 @@ def test_real_project_migrations_apply_cleanly():
     assert applied == [1, 2, 3]
 
 
-def test_unversioned_legacy_database_logs_warning_but_does_not_crash(caplog):
+def test_unversioned_legacy_database_fails_fast_and_stays_unmigrated():
     """
-    Simulerer en database fra FØR migrationssystemet: en tabel med samme navn
-    som en kernetabel findes allerede, men schema_migrations er tom.
-    Migration 001 bruger CREATE TABLE IF NOT EXISTS, så den fejler ikke -
-    men vi forventer en tydelig advarsel om at dette er en unversioneret
-    legacy-database (se docs/architecture-decisions.md).
+    Simulerer en database fra FØR migrationssystemet: en tabel med samme
+    navn som en kernetabel findes allerede (med en AFVIGENDE struktur), men
+    schema_migrations er tom. Migration 001 bruger CREATE TABLE IF NOT
+    EXISTS, så den ville IKKE fejle af sig selv og ville bare lade den
+    gamle tabel stå urørt - derfor skal apply_migrations fejle EKSPLICIT
+    FØR nogen migration bliver anvendt eller registreret (se
+    docs/architecture-decisions.md).
     """
     engine = get_engine(db_path=Path(":memory:"))
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE ingested_files (some_old_column TEXT)"))
 
-    import logging
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(UnversionedLegacyDatabaseError):
         apply_migrations(engine, migrations_dir=MIGRATIONS_DIR)
 
-    assert any("unversioneret" in record.message.lower() for record in caplog.records)
+    with engine.connect() as conn:
+        # Ingen migrationer må være registreret som anvendt.
+        versions = [r[0] for r in conn.execute(
+            text("SELECT version FROM schema_migrations")
+        ).fetchall()]
+        assert versions == []
+
+        # Den gamle, afvigende tabel må IKKE være blevet erstattet/ændret -
+        # den forkerte kolonne skal stadig findes.
+        columns = [row[1] for row in conn.execute(
+            text("PRAGMA table_info(ingested_files)")
+        ).fetchall()]
+        assert columns == ["some_old_column"]

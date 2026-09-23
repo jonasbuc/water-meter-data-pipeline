@@ -119,6 +119,26 @@ def _applied_versions(engine: Engine) -> set:
     return {row[0] for row in rows}
 
 
+class UnversionedLegacyDatabaseError(Exception):
+    """
+    Rejses når `apply_migrations` opdager en database der allerede
+    indeholder kernetabeller (fx 'ingested_files'), men hvor
+    `schema_migrations` er tom - dvs. en database fra FØR
+    migrationssystemet blev indført.
+
+    Vi fejler BEVIDST hårdt her i stedet for blot at logge en advarsel og
+    fortsætte: migration 001 bruger `CREATE TABLE IF NOT EXISTS`, som
+    IKKE opgraderer en eksisterende tabel med en afvigende struktur - den
+    efterlader den bare urørt. Hvis vi lod migration 001 blive registreret
+    som "anvendt" i den situation, ville databasen fremstå fuldt migreret,
+    selvom den faktiske tabelstruktur kan være helt anderledes end det
+    migrationerne forventer. Det er langt farligere end at stoppe med en
+    tydelig fejl.
+    """
+
+    pass
+
+
 def _looks_like_unversioned_legacy_database(engine: Engine) -> bool:
     """
     Lille, bevidst simpel vagt (IKKE et fuldt schema-introspektions-system):
@@ -143,22 +163,38 @@ def _looks_like_unversioned_legacy_database(engine: Engine) -> bool:
     return legacy_table_exists is not None
 
 
-def _warn_if_unversioned_legacy_database(engine: Engine) -> None:
+def _fail_fast_if_unversioned_legacy_database(engine: Engine) -> None:
+    """
+    Rejser `UnversionedLegacyDatabaseError` hvis databasen ser ud til at
+    være en unversioneret legacy-database (se
+    `_looks_like_unversioned_legacy_database`).
+
+    SIKKERHEDSGARANTI: denne funktion ændrer ALDRIG eksisterende tabeller,
+    og ingen migration bliver anvendt eller registreret, hvis den rejser.
+    `schema_migrations` er på dette tidspunkt allerede blevet bootstrapped
+    (oprettet, hvis den ikke fandtes) af `_ensure_migrations_table` - det
+    er den ENESTE tilladte skema-ændring før vi eventuelt fejler. Det er et
+    bevidst, minimalt trade-off: at oprette en tom sporings-tabel er
+    ufarligt og nødvendigt for overhovedet at kunne AFGØRE om databasen er
+    unversioneret (vi skal kunne forespørge den) - men INGEN projektmigration
+    (001, 002, 003 ...) bliver anvendt eller registreret i den.
+    """
     if not _looks_like_unversioned_legacy_database(engine):
         return
     if _applied_versions(engine):
         return
-    import logging
-
-    logging.getLogger(__name__).warning(
-        "Databasen indeholder allerede tabeller (fx 'ingested_files'), men "
-        "'schema_migrations' er tom. Dette ligner en UNVERSIONERET database "
-        "fra FØR migrationssystemet blev indført - migration 001 bruger "
-        "CREATE TABLE IF NOT EXISTS og vil derfor IKKE opgradere en "
-        "eksisterende, afvigende tabelstruktur. Migrationshistorikken er "
-        "kun autoritativ fra v001 og frem. Anbefaling: slet/genskab "
-        "databasefilen, eller baseline den manuelt ved at indsætte de "
-        "rigtige rækker i schema_migrations. Se docs/architecture-decisions.md."
+    raise UnversionedLegacyDatabaseError(
+        "Unversioneret pre-migration database registreret: der findes "
+        "allerede tabeller (fx 'ingested_files'), men 'schema_migrations' "
+        "er tom. Migration 001 er projektets BASELINE - CREATE TABLE IF "
+        "NOT EXISTS kan ikke sikkert opgradere et ukendt, historisk skema "
+        "(den vil bare lade den eksisterende, muligvis afvigende tabel stå "
+        "urørt, mens migrationen alligevel registreres som 'anvendt'). "
+        "Løsning: enten (a) slet/genskab udviklingsdatabasen, eller (b) "
+        "baseline/migrer den manuelt (indsæt de rigtige rækker i "
+        "schema_migrations selv, efter at have bekræftet at den eksisterende "
+        "tabelstruktur reelt matcher migrationerne). Se "
+        "docs/architecture-decisions.md."
     )
 
 
@@ -180,7 +216,7 @@ def apply_migrations(engine: Engine, migrations_dir: Path = MIGRATIONS_DIR) -> L
     from datetime import datetime, timezone
 
     _ensure_migrations_table(engine)
-    _warn_if_unversioned_legacy_database(engine)
+    _fail_fast_if_unversioned_legacy_database(engine)
     already_applied = _applied_versions(engine)
 
     newly_applied = []
