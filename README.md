@@ -40,7 +40,7 @@ Transformation (src/transformation.py)
 ANALYTICS     dim_meter  +  fact_water_consumption
    │
    ▼
-Power BI / SQL-analyse
+Streamlit / Power BI
 ```
 
 Orkestreringen af alle trin sker i `src/pipeline.py`, som også skriver til
@@ -73,6 +73,15 @@ migrations/
 docs/
   architecture-decisions.md  # ADR-001..008: kort Context/Decision/Trade-off
 
+dashboard/
+  app.py                   # Streamlit-layout, sider, sidebar-filtre (BI-konsument)
+  data.py                  # read-only SQL-forespørgsler / DataFrame-loading
+  charts.py                # genbrugelige Plotly-charts
+
+scripts/
+  generate_dashboard_demo_data.py  # genererer SYNTETISKE kilde-filer (CSV/JSON)
+  run_dashboard_demo_pipeline.py   # kører den RIGTIGE pipeline mod dem
+
 tests/
   test_validation.py
   test_transformation.py
@@ -81,8 +90,10 @@ tests/
   test_migrations.py
   test_ingestion_atomicity.py
   test_config_and_constraints.py
+  test_dashboard_data.py
+  test_dashboard_import_smoke.py
 
-.github/workflows/tests.yml # CI: kører pytest på push/PR
+.github/workflows/tests.yml # CI: kører pytest + demo på push/PR
 
 main.py                    # kør hele pipeline'en, eller `--demo` for en selvstændig demo
 ```
@@ -93,6 +104,7 @@ main.py                    # kør hele pipeline'en, eller `--demo` for en selvst
 python main.py              # kør pipeline mod data/warehouse.db
 python main.py --demo       # kør en selvstændig demo mod en frisk data/demo.db
 pytest                       # kør tests
+streamlit run dashboard/app.py   # start BI-dashboardet (se "BI dashboard" nedenfor)
 ```
 
 ## Design-beslutninger
@@ -218,6 +230,93 @@ Se `sql/analytics_queries.sql` for forespørgsler du kan træne på:
 daglige totaler, top-10 målere, gennemsnit, window functions (`LAG`,
 `AVG OVER`), JOIN mellem fact/dim, data quality-overblik, pipeline health,
 og en lineage/debugging-forespørgsel (se "Data lineage" nedenfor).
+
+## BI dashboard
+
+Dashboardet i `dashboard/` er en **demonstrations-BI-konsument** af
+analytics-laget - præcis den rolle Power BI ville have i produktion, hvis
+det pegede på den samme SQLite-fil (eller en SQL Server-migrering af den,
+se "SQLite → SQL Server mapping"). Det er bevidst placeret UDENFOR
+pipeline-arkitekturen:
+
+```
+RAW
+ ↓
+STAGING
+ ↓
+ANALYTICS   (dim_meter + fact_water_consumption)
+ ↓
+Streamlit / Power BI   <- dashboard/ hører til HER
+```
+
+**Arkitektur-grænse** (vigtig, se `docs/architecture-decisions.md`):
+dashboardet er 100% READ-ONLY. Det indsætter, opdaterer, sletter aldrig
+noget, og det kører aldrig migrationer, ingestion eller pipelinen
+automatisk. Det forespørger, filtrerer, aggregerer og visualiserer det
+allerede-transformerede analytics-lag - det duplikerer eller genopfinder
+IKKE nogen validerings- eller transformationslogik. Kort sagt: "BI-laget
+konsumerer analytics-modellen; det afgør ikke om kildedata er gyldig."
+
+### Struktur
+
+- `dashboard/app.py` — Streamlit-layout, sider og sidebar-filtre.
+- `dashboard/data.py` — read-only, parameteriserede SQL-forespørgsler
+  (ingen INSERT/UPDATE/DELETE).
+- `dashboard/charts.py` — genbrugelige Plotly-charts.
+
+### Sider
+
+1. **Overview** — KPI'er (samlet forbrug, gennemsnit, aktive målere,
+   mistænkelige målinger, data quality rate), forbrug over tid, top
+   målere, status-fordeling, og en tabel over mistænkelige målinger.
+2. **Meter Analysis** — detaljeret profil for én valgt måler (KPI'er,
+   forbrug over tid med mistænkelige målinger markeret, temperatur over
+   tid, aflæsningstabel).
+3. **Data Quality** — `data_quality_errors`-overblik: fejltyper, severity
+   (ERROR/WARNING) og en filtrerbar tabel over seneste problemer.
+4. **Pipeline Health** — `pipeline_runs`-overblik: seneste kørsel, rækker
+   behandlet, fejlede kørsler (eller en positiv "ingen fejl"-besked).
+5. **Data Lineage** — vælg et `fact_id` og følg kæden
+   fact → staging → raw → kilde-fil, inklusive `raw_payload` i en
+   udvidelig sektion. Besvarer "hvor kommer dette tal helt præcist fra?".
+
+### Kør dashboardet
+
+```bash
+pip install -r requirements.txt
+streamlit run dashboard/app.py
+```
+
+Dashboardet peger som standard på `data/warehouse.db`. Peg det på en
+anden database (fx den rigere demo-database nedenfor) med miljøvariablen
+`DASHBOARD_DB_PATH`:
+
+```bash
+DASHBOARD_DB_PATH="data/dashboard_demo.db" streamlit run dashboard/app.py
+```
+
+Den aktive database-sti vises altid i sidebaren, så det aldrig er
+tvetydigt hvilken database der ses.
+
+### Rigere demodata til dashboardet
+
+Den lille eksisterende `data/raw/`-sample (13 rækker) er nok til
+pipeline-tests, men for tyndt til en visuelt meningsfuld BI-demo. Et
+separat, deterministisk script genererer SYNTETISKE kilde-filer (6 målere,
+30 dage, ~720 rækker, inkl. et par bevidst designede
+datakvalitetsproblemer og mistænkelige målinger) og kører dem gennem den
+**rigtige, uændrede pipeline** - dashboardet viser ALDRIG data der ikke er
+gået gennem ingestion/validation/transformation:
+
+```bash
+python scripts/generate_dashboard_demo_data.py   # -> data/dashboard_demo_raw/*.csv|json
+python -m scripts.run_dashboard_demo_pipeline    # -> data/dashboard_demo.db (via rigtig pipeline)
+DASHBOARD_DB_PATH="data/dashboard_demo.db" streamlit run dashboard/app.py
+```
+
+Denne genererede data er tydeligt dokumenteret som **SYNTETISK
+DEMONSTRATIONSDATA** i scriptets docstring og kommentarer - det er ikke
+rigtige målinger fra noget forsyningsselskab.
 
 ## Duplicate handling: hvorfor DUPLICATE_EXISTING ikke er en data-kvalitetsfejl
 
